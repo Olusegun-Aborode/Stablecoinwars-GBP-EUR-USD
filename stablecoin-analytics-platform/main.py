@@ -96,6 +96,8 @@ def main():
     try:
         # Step 1: Extract metrics from all chains
         metrics = extract_all_chains()
+        # Ensure only valid metric dictionaries are processed
+        metrics = [m for m in metrics if isinstance(m, dict)]
         logger.info(f"Extracted {len(metrics)} metric records")
         
         if not metrics:

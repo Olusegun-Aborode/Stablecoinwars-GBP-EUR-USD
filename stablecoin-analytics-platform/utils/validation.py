@@ -25,6 +25,11 @@ def validate_metrics(metrics: Dict[str, Any]) -> bool:
     Returns:
         True if metrics pass validation, False otherwise
     """
+    # Basic type guard
+    if not isinstance(metrics, dict):
+        logger.warning("Validation error: metrics is not a dict")
+        return False
+
     # Check required fields
     required_fields = ['coin', 'currency', 'chain', 'timestamp', 'supply']
     for field in required_fields:
@@ -75,7 +80,15 @@ def validate_supply_against_defillama(metrics: Dict[str, Any]) -> bool:
         # Add more as needed
     }
     
-    token_id = token_map.get(metrics['coin'])
+    # Guard against incomplete or non-dict metrics
+    if not isinstance(metrics, dict):
+        return True
+    coin = metrics.get('coin')
+    chain = metrics.get('chain', '')
+    if not coin:
+        return True
+
+    token_id = token_map.get(coin)
     if not token_id:
         # No mapping available, skip validation
         return True
@@ -88,16 +101,16 @@ def validate_supply_against_defillama(metrics: Dict[str, Any]) -> bool:
         data = response.json()
         
         # Find supply for the specific chain
-        if 'chainBalances' in data:
+        if 'chainBalances' in data and isinstance(data['chainBalances'], list):
             for chain_data in data['chainBalances']:
-                if chain_data.get('chain', '').lower() == metrics['chain'].lower():
+                if chain_data.get('chain', '').lower() == chain.lower():
                     # Get circulating supply
                     llama_supply_data = chain_data.get('circulating', {})
                     llama_supply = float(llama_supply_data.get('peggedUSD', 0))
                     
                     # Convert to token amount (assuming ~$1 peg)
                     # In production, use actual price
-                    extracted_supply = metrics['supply']
+                    extracted_supply = metrics.get('supply', 0)
                     
                     # Calculate variance
                     if llama_supply > 0:

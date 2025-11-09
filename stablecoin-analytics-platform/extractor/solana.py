@@ -96,10 +96,13 @@ def extract_solana_metrics(symbol: str, address: str) -> Optional[Dict[str, Any]
         
         # Get token supply
         supply_response = client.get_token_supply(mint_pubkey)
-        if not supply_response.value:
-            logger.error(f"Could not fetch supply for {symbol}")
+        # Guard against RPC error objects without a `value` attribute
+        if not hasattr(supply_response, "value") or not supply_response.value:
+            logger.error(
+                f"Could not fetch supply for {symbol} (invalid response: {type(supply_response).__name__})"
+            )
             return None
-        
+
         decimals = supply_response.value.decimals
         total_supply = float(supply_response.value.amount) / (10 ** decimals)
         
@@ -110,8 +113,9 @@ def extract_solana_metrics(symbol: str, address: str) -> Optional[Dict[str, Any]
                 mint_pubkey,
                 limit=1000
             )
-            
-            if not signatures_response.value:
+
+            # Guard against RPC error objects without a `value` attribute
+            if not hasattr(signatures_response, "value") or not signatures_response.value:
                 logger.warning(f"No signatures found for {symbol}")
                 transfer_count = 0
                 transfer_volume = 0
@@ -173,12 +177,15 @@ def get_detailed_transfer_volume(client: Client, signatures: List[Signature], de
                 encoding="json",
                 max_supported_transaction_version=0
             )
-            
-            if not tx_response.value:
+
+            # Guard against RPC error objects or empty responses
+            if not hasattr(tx_response, "value") or not tx_response.value:
                 continue
-            
+
             # Robust dict-based parsing of transaction structure
             tx = tx_response.value
+            if not isinstance(tx, dict):
+                continue
             transaction = tx.get('transaction', {})
             message = transaction.get('message', {})
 
