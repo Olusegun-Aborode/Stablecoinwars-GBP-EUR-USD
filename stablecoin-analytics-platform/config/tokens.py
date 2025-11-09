@@ -13,14 +13,6 @@ STABLECOINS = {
         "tGBP": "0x00000000441378008EA67F4284A57932B1c000a5",
         "GBPT": "0x86B4dBE5D203e634a12364C0e428fa242A3FbA98",
     },
-    "polygon": {
-        "USDC": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-        "USDT": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
-    },
-    "base": {
-        "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-        "EURC": "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",
-    },
     "solana": {
         "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
