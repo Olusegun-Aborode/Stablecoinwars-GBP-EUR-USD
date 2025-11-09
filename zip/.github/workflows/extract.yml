@@ -1,0 +1,51 @@
+name: Stablecoin Data Extraction
+
+on:
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: zip-hourly-extract
+      cancel-in-progress: true
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run extraction
+        env:
+          # RPC endpoints
+          ALCHEMY_ETH_URL: ${{ secrets.ALCHEMY_ETH_URL }}
+          ALCHEMY_SOL_URL: ${{ secrets.ALCHEMY_SOL_URL }}
+          
+          # Database
+          NEON_DB_URL: ${{ secrets.NEON_DB_URL }}
+          
+          # APIs
+          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
+          
+          # Alerting
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python main.py
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: extraction-logs
+          path: extraction.log
+          retention-days: 7
