@@ -1,0 +1,24 @@
+
+        # Process Solana 
+        if 'solana' in STABLECOINS: 
+            print(f"\n  Chain: SOLANA") 
+            
+            for token_symbol, token_address in STABLECOINS['solana'].items(): 
+                print(f"    Token: {token_symbol}") 
+                
+                try: 
+                    transfers = extract_solana_transfers( 
+                        token_symbol, token_address, 24 
+                    ) 
+                    
+                    if transfers: 
+                        inserted = insert_transfers_batch(conn, transfers, tagged_addresses) 
+                        day_transfers += inserted 
+                        print(f"    ✓ Inserted {inserted} transfers") 
+                    else: 
+                        print(f"    - No transfers found") 
+                        
+                except Exception as e: 
+                    print(f"    ✗ Error: {e}") 
+                
+                time.sleep(0.5) 

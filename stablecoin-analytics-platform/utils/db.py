@@ -1,0 +1,182 @@
+"""
+Database Utilities Module
+Handles all database interactions with Neon Postgres
+"""
+
+import os
+import logging
+import psycopg
+from typing import List, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+# Database connection string from environment
+# Prefer NEON_DB_URL; fallback to DATABASE_URL if provided by platform
+DATABASE_URL = os.getenv('NEON_DB_URL') or os.getenv('DATABASE_URL', '')
+
+
+def _sanitize_conninfo(raw: str) -> str:
+    """Sanitize a connection string that may have been pasted as a full psql command.
+
+    Examples handled:
+    - "psql 'postgresql://user:pass@host/db?sslmode=require'"
+    - "postgresql://user:pass@host/db?sslmode=require" (kept as-is)
+    - quoted DSNs (strip surrounding quotes)
+    """
+    s = (raw or '').strip()
+    # If it contains a postgres DSN, extract it
+    for proto in ('postgresql://', 'postgres://'):
+        if proto in s:
+            start = s.find(proto)
+            # Extract until whitespace or end
+            end = len(s)
+            for i in range(start, len(s)):
+                if s[i] in (' ', '\n', '"', "'"):
+                    end = i
+                    break
+            dsn = s[start:end]
+            return dsn.strip("'\"")
+    # Otherwise just strip quotes
+    return s.strip("'\"")
+
+
+def get_db_connection():
+    """
+    Get a connection to the Neon Postgres database.
+    
+    Returns:
+        psycopg2 connection object
+    
+    Raises:
+        Exception if connection fails
+    """
+    if not DATABASE_URL:
+        raise ValueError("NEON_DB_URL (or DATABASE_URL) environment variable not set")
+    
+    try:
+        conninfo = _sanitize_conninfo(DATABASE_URL)
+        if conninfo != DATABASE_URL:
+            logger.warning("Sanitized NEON_DB_URL from a shell command to DSN format")
+        conn = psycopg.connect(conninfo)
+        logger.debug("Database connection established")
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {str(e)}")
+        raise
+
+
+def initialize_schema(conn):
+    """
+    Initialize the database schema if it doesn't exist.
+    
+    Args:
+        conn: Database connection
+    """
+    schema_sql = """
+    -- Main metrics table
+    CREATE TABLE IF NOT EXISTS stablecoin_metrics (
+        id SERIAL PRIMARY KEY,
+        coin VARCHAR(10) NOT NULL,
+        currency VARCHAR(3) NOT NULL,
+        chain VARCHAR(20) NOT NULL,
+        timestamp TIMESTAMP NOT NULL,
+        supply DECIMAL(38,18),
+        transfers_count INTEGER,
+        transfers_volume DECIMAL(38,18),
+        tvl DECIMAL(38,18),
+        peg_deviation DECIMAL(8,6),
+        usd_equivalent_volume DECIMAL(38,6),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Indexes for performance
+    CREATE INDEX IF NOT EXISTS idx_currency_coin_time 
+        ON stablecoin_metrics(currency, coin, timestamp DESC);
+    
+    CREATE INDEX IF NOT EXISTS idx_chain_time 
+        ON stablecoin_metrics(chain, timestamp DESC);
+    
+    CREATE INDEX IF NOT EXISTS idx_timestamp 
+        ON stablecoin_metrics(timestamp DESC);
+    
+    -- Materialized view for daily aggregates
+    CREATE MATERIALIZED VIEW IF NOT EXISTS daily_metrics AS
+    SELECT
+        coin,
+        currency,
+        chain,
+        DATE(timestamp) as day,
+        AVG(supply) as avg_supply,
+        MAX(supply) as max_supply,
+        MIN(supply) as min_supply,
+        SUM(transfers_count) as total_transfers,
+        SUM(transfers_volume) as total_volume,
+        AVG(tvl) as avg_tvl,
+        AVG(peg_deviation) as avg_peg_deviation
+    FROM stablecoin_metrics
+    GROUP BY coin, currency, chain, DATE(timestamp);
+    
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_metrics_unique
+        ON daily_metrics(coin, chain, day);
+    """
+    
+    try:
+        with conn.cursor() as cur:
+            cur.execute(schema_sql)
+        conn.commit()
+        logger.info("Database schema initialized successfully")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to initialize schema: {str(e)}")
+        raise
+
+
+def insert_metrics(conn, metrics: List[Dict[str, Any]]):
+    """
+    Batch insert metrics into the database.
+    
+    Args:
+        conn: Database connection
+        metrics: List of metric dictionaries
+    """
+    if not metrics:
+        return
+    
+    insert_sql = """
+    INSERT INTO stablecoin_metrics (
+        coin, currency, chain, timestamp, supply, 
+        transfers_count, transfers_volume, tvl, 
+        peg_deviation, usd_equivalent_volume
+    ) VALUES (
+        %(coin)s, %(currency)s, %(chain)s, %(timestamp)s, %(supply)s,
+        %(transfers_count)s, %(transfers_volume)s, %(tvl)s,
+        %(peg_deviation)s, %(usd_equivalent_volume)s
+    )
+    """
+    
+    try:
+        # psycopg v3 pipelines executemany, providing efficient batch inserts
+        with conn.cursor() as cur:
+            cur.executemany(insert_sql, metrics)
+        logger.info(f"Inserted {len(metrics)} metric records")
+    except Exception as e:
+        logger.error(f"Failed to insert metrics: {str(e)}")
+        raise
+
+
+def refresh_materialized_view(conn):
+    """
+    Refresh the daily_metrics materialized view.
+    Should be run after inserting new data.
+    
+    Args:
+        conn: Database connection
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY daily_metrics")
+        conn.commit()
+        logger.info("Materialized view refreshed")
+    except Exception as e:
+        conn.rollback()
+        logger.warning(f"Failed to refresh materialized view: {str(e)}")

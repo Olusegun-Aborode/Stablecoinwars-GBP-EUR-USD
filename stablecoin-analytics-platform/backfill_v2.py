@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+Backfill categorized transfers for a specified number of days.
+Uses the same logic as extractor/transfers.py with a larger lookback window.
+"""
+
+import os
+import sys
+import argparse
+import time
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, List
+
+from dotenv import load_dotenv
+import psycopg
+from web3 import Web3
+
+# Ensure project root is on sys.path when running as a script
+PROJECT_ROOT = Path(__file__).resolve().parents[0]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+PARENT_ROOT = Path(__file__).resolve().parents[1]
+if str(PARENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PARENT_ROOT))
+
+from config.tokens import STABLECOINS
+from extractor.evm import get_web3_connection, ERC20_ABI
+from extractor.transfers import ensure_table, load_tag_map  # reuse table creation and tagging
+from extractor.solana_transfers import extract_solana_transfers
+
+
+BLOCKS_PER_HOUR = {
+    'ethereum': 300,
+    'polygon': 1800,
+    'base': 1800,
+}
+
+
+def backfill_chain(conn, chain: str, tokens: Dict[str, str], hours: int) -> int:
+    """Backfill transfers for a specific chain over the given hours."""
+    w3 = get_web3_connection(chain)
+    if not w3:
+        print(f"Warning: Could not connect to {chain} RPC; skipping")
+        return 0
+
+    # Load tags for this chain once
+    tag_map = load_tag_map(conn, chain)
+    total_inserted = 0
+
+    for symbol, token_addr in tokens.items():
+        try:
+            checksum_addr = Web3.to_checksum_address(token_addr)
+        except Exception:
+            # Skip placeholder or invalid addresses
+            continue
+
+        contract = w3.eth.contract(address=checksum_addr, abi=ERC20_ABI)
+        try:
+            decimals = contract.functions.decimals().call()
+        except Exception:
+            decimals = 18
+
+        current_block = w3.eth.block_number
+        from_block = max(0, current_block - BLOCKS_PER_HOUR.get(chain, 300) * max(1, hours))
+
+        transfer_topic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+
+        # Chunk fetching to be provider-friendly
+        chunk_size = max(100, min(1000, BLOCKS_PER_HOUR.get(chain, 300)))
+        start_block = from_block
+        logs: List[dict] = []
+        while start_block <= current_block:
+            end_block = min(start_block + chunk_size - 1, current_block)
+            try:
+                logs_chunk = w3.eth.get_logs({
+                    'address': checksum_addr,
+                    'topics': [transfer_topic],
+                    'fromBlock': start_block,
+                    'toBlock': end_block
+                })
+                if logs_chunk:
+                    logs.extend(logs_chunk)
+            except Exception:
+                pass
+            finally:
+                start_block = end_block + 1
+
+        if not logs:
+            continue
+
+        with conn.cursor() as cur:
+            for log in logs:
+                try:
+                    evt = contract.events.Transfer().process_log(log)
+                    from_addr = evt['args']['from']
+                    to_addr = evt['args']['to']
+                    value = evt['args']['value']
+                    amount = value / (10 ** decimals)
+
+                    # Block timestamp
+                    try:
+                        blk = w3.eth.get_block(log['blockNumber'])
+                        block_time = datetime.fromtimestamp(blk['timestamp'], tz=timezone.utc)
+                    except Exception:
+                        block_time = datetime.now(timezone.utc)
+
+                    # Tagging info
+                    sender_info = tag_map.get(from_addr.lower())
+                    receiver_info = tag_map.get(to_addr.lower())
+
+                    cur.execute(
+                        """
+                        INSERT INTO categorized_transfers (
+                            timestamp, chain, token_symbol, token_address, tx_hash,
+                            from_address, to_address, amount,
+                            category_sender, label_sender, category_receiver, label_receiver
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (tx_hash, token_address, from_address, to_address, amount)
+                        DO NOTHING;
+                        """,
+                        (
+                            block_time, chain, symbol, checksum_addr, log['transactionHash'].hex(),
+                            from_addr, to_addr, amount,
+                            sender_info['category'] if sender_info else None,
+                            sender_info['label'] if sender_info else None,
+                            receiver_info['category'] if receiver_info else None,
+                            receiver_info['label'] if receiver_info else None,
+                        )
+                    )
+                    total_inserted += 1
+                except Exception:
+                    # Skip malformed log
+                    continue
+            conn.commit()
+
+    return total_inserted
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Backfill categorized transfers")
+    parser.add_argument("--days", type=int, default=1, help="Number of days to backfill")
+    args = parser.parse_args()
+
+    hours = max(1, args.days * 24)
+
+    load_dotenv()
+    # Override RPC endpoints if provided via environment
+    rpc_endpoints = {
+        "ethereum": os.getenv("ALCHEMY_ETH_URL"),
+        "polygon": os.getenv("ALCHEMY_POLYGON_URL"),
+        "base": os.getenv("ALCHEMY_BASE_URL"),
+    }
+    try:
+        import extractor.evm as evm_mod
+        for k, v in rpc_endpoints.items():
+            if v:
+                evm_mod.RPC_ENDPOINTS[k] = v
+    except Exception:
+        pass
+
+    url = os.getenv("NEON_DB_URL")
+    if not url:
+        print("ERROR: NEON_DB_URL is not set")
+        return 1
+
+    try:
+        with psycopg.connect(url) as conn:
+            ensure_table(conn)
+
+            total = 0
+            for chain in ['ethereum']:
+                tokens = STABLECOINS.get(chain, {})
+                if not tokens:
+                    continue
+                inserted = backfill_chain(conn, chain, tokens, hours)
+                print(f"Chain {chain}: inserted {inserted} transfers (last {hours}h)")
+                total += inserted
+
+            # Process Solana
+            if 'solana' in STABLECOINS:
+                print(f"\n  Chain: SOLANA")
+                sol_tokens = STABLECOINS.get('solana', {})
+                # Load tags for solana once
+                sol_tag_map = load_tag_map(conn, 'solana')
+                for token_symbol, token_address in sol_tokens.items():
+                    print(f"    Token: {token_symbol}")
+                    try:
+                        transfers = extract_solana_transfers(
+                            token_symbol, token_address, hours
+                        )
+                        if transfers:
+                            inserted_count = 0
+                            with conn.cursor() as cur:
+                                for t in transfers:
+                                    try:
+                                        # Tagging lookup for sender/receiver
+                                        s_addr = t.get('sender')
+                                        r_addr = t.get('receiver')
+                                        s_info = sol_tag_map.get((s_addr or '').lower()) if isinstance(s_addr, str) else None
+                                        r_info = sol_tag_map.get((r_addr or '').lower()) if isinstance(r_addr, str) else None
+
+                                        cur.execute(
+                                            """
+                                            INSERT INTO categorized_transfers (
+                                                timestamp, chain, token_symbol, token_address, tx_hash,
+                                                from_address, to_address, amount,
+                                                category_sender, label_sender, category_receiver, label_receiver
+                                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                            ON CONFLICT (tx_hash, token_address, from_address, to_address, amount)
+                                            DO NOTHING;
+                                            """,
+                                            (
+                                                t.get('timestamp'), t.get('chain', 'solana'), t.get('token_symbol', token_symbol),
+                                                t.get('token_address', token_address), t.get('transaction_hash'),
+                                                t.get('sender'), t.get('receiver'), float(t.get('value', 0) or 0),
+                                                (s_info['category'] if s_info else None),
+                                                (s_info['label'] if s_info else None),
+                                                (r_info['category'] if r_info else None),
+                                                (r_info['label'] if r_info else None),
+                                            )
+                                        )
+                                        inserted_count += 1
+                                    except Exception:
+                                        continue
+                                conn.commit()
+                            print(f"    ✓ Inserted {inserted_count} transfers")
+                        else:
+                            print(f"    - No transfers found")
+                    except Exception as e:
+                        print(f"    ✗ Error: {e}")
+                    time.sleep(0.5)
+
+            print(f"✓ Total transfers inserted: {total}")
+            return 0
+    except Exception as e:
+        print("ERROR during backfill:", e)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

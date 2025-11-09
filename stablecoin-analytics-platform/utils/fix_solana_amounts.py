@@ -1,0 +1,140 @@
+"""
+Fix zero amounts for Solana transfers by decoding TransferChecked instructions.
+
+Targets rows in `categorized_transfers` with chain='solana' and amount=0 in the last 24h,
+fetches transaction details, decodes SPL Token TransferChecked instructions, and updates
+the `amount` field accordingly.
+"""
+
+import os
+import base58
+import requests
+from typing import List, Dict
+from datetime import datetime, timezone
+
+import psycopg
+from dotenv import load_dotenv
+
+# Prefer Helius RPC if available
+RPC_URL = os.getenv('ALCHEMY_SOL_URL', 'https://api.mainnet-beta.solana.com')
+
+
+def get_mint_decimals(mint: str) -> int:
+    try:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]}
+        r = requests.post(RPC_URL, json=payload, timeout=15)
+        dec = (r.json() or {}).get('result', {}).get('value', {}).get('decimals')
+        if isinstance(dec, int):
+            return dec
+    except Exception:
+        pass
+    return 6
+
+
+def get_transaction(tx_hash: str) -> Dict:
+    try:
+        payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+            "params": [tx_hash, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
+        }
+        r = requests.post(RPC_URL, json=payload, timeout=30)
+        return (r.json() or {}).get('result') or {}
+    except Exception:
+        return {}
+
+
+def parse_transfer_amount(tx: Dict, mint: str, decimals: int) -> float:
+    try:
+        transaction = tx.get('transaction', {})
+        message = transaction.get('message', {})
+
+        raw_account_keys = message.get('accountKeys', [])
+        account_keys: List[str] = []
+        for k in raw_account_keys:
+            if isinstance(k, dict):
+                pk = k.get('pubkey')
+                if isinstance(pk, str):
+                    account_keys.append(pk)
+            elif isinstance(k, str):
+                account_keys.append(k)
+
+        instructions = message.get('instructions', [])
+        for ix in instructions:
+            program_id_index = ix.get('programIdIndex')
+            if program_id_index is None or program_id_index >= len(account_keys):
+                continue
+            program_id = account_keys[program_id_index]
+            if program_id != "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
+                continue
+            data_b58 = ix.get('data')
+            if not isinstance(data_b58, str):
+                continue
+            try:
+                instruction_data = base58.b58decode(data_b58)
+            except Exception:
+                continue
+            if len(instruction_data) < 9:
+                continue
+            instr_type = instruction_data[0]
+            # 12 = TransferChecked
+            if instr_type != 12:
+                continue
+            accounts_idx = ix.get('accounts', [])
+            if not isinstance(accounts_idx, list) or len(accounts_idx) < 2:
+                continue
+            mint_idx = accounts_idx[1]
+            if isinstance(mint_idx, int) and mint_idx < len(account_keys):
+                mint_addr = account_keys[mint_idx]
+                if mint_addr == mint:
+                    amount_u64 = int.from_bytes(instruction_data[1:9], byteorder='little')
+                    return amount_u64 / (10 ** decimals)
+    except Exception:
+        pass
+    return 0.0
+
+
+def main():
+    load_dotenv()
+    url = os.getenv('NEON_DB_URL')
+    if not url:
+        raise RuntimeError('NEON_DB_URL is not set')
+
+    updated = 0
+    checked = 0
+    with psycopg.connect(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, tx_hash, token_address
+                FROM categorized_transfers
+                WHERE chain = 'solana' AND amount = 0
+                  AND timestamp > NOW() - INTERVAL '1 day'
+                """
+            )
+            rows = cur.fetchall()
+        print(f"Found {len(rows)} Solana rows with zero amount to fix")
+
+        for row in rows:
+            id_, tx_hash, mint = row
+            decimals = get_mint_decimals(mint)
+            tx = get_transaction(tx_hash)
+            amt = parse_transfer_amount(tx, mint, decimals)
+            checked += 1
+            if amt and amt > 0:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE categorized_transfers SET amount = %s WHERE id = %s",
+                            (amt, id_)
+                        )
+                    conn.commit()
+                    updated += 1
+                except Exception:
+                    continue
+
+    print(f"✓ Checked {checked} rows; updated {updated} with decoded amounts")
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
