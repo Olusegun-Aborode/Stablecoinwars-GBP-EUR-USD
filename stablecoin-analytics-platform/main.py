@@ -16,7 +16,6 @@ load_dotenv()
 
 from extractor.evm import extract_evm_metrics
 from extractor.solana import extract_solana_metrics
-from extractor.api import fetch_defi_tvl
 from utils.db import get_db_connection, insert_metrics
 from utils.validation import validate_metrics
 from config.tokens import STABLECOINS, CHAINS
@@ -71,21 +70,6 @@ def extract_all_chains() -> List[Dict[str, Any]]:
     return all_metrics
 
 
-def enrich_with_defi_data(metrics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Enrich metrics with DeFi TVL data from APIs."""
-    logger.info("Enriching with DeFi TVL data...")
-    
-    for metric in metrics:
-        try:
-            tvl = fetch_defi_tvl(metric['coin'], metric['chain'])
-            metric['tvl'] = tvl
-        except Exception as e:
-            logger.warning(f"Could not fetch TVL for {metric['coin']}: {str(e)}")
-            metric['tvl'] = 0
-    
-    return metrics
-
-
 def main():
     """Main execution function."""
     logger.info("=" * 60)
@@ -104,10 +88,7 @@ def main():
             logger.warning("No metrics extracted. Exiting.")
             return
         
-        # Step 2: Enrich with DeFi data
-        metrics = enrich_with_defi_data(metrics)
-        
-        # Step 3: Validate metrics
+        # Step 2: Validate metrics (TVL enrichment removed)
         logger.info("Validating extracted metrics...")
         validated_metrics = []
         for metric in metrics:
@@ -118,7 +99,7 @@ def main():
         
         logger.info(f"{len(validated_metrics)}/{len(metrics)} metrics passed validation")
         
-        # Step 4: Store in database
+        # Step 3: Store in database
         if validated_metrics:
             logger.info("Storing metrics in database...")
             conn = get_db_connection()
